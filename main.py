@@ -23,6 +23,44 @@ state_lock = threading.Lock()
 
 app = Flask(__name__)
 
+CUSTOM_EMOJIS = {
+    "coins": "🪙",
+    "pumpking": "🎃"
+}
+
+def load_custom_emojis(app_id, guilds=None):
+    if not BOT_TOKEN or not app_id:
+        return
+    headers = {"Authorization": f"Bot {BOT_TOKEN}"}
+    try:
+        url = f"https://discord.com/api/v10/applications/{app_id}/emojis"
+        resp = requests.get(url, headers=headers, timeout=10)
+        if resp.status_code == 200:
+            items = resp.json().get("items", [])
+            for item in items:
+                name = item.get("name", "").lower()
+                eid = item.get("id")
+                anim = item.get("animated", False)
+                prefix = "a" if anim else ""
+                tag = f"<{prefix}:{ item.get('name') }:{eid}>"
+                if name in ("coins", "coin"):
+                    CUSTOM_EMOJIS["coins"] = tag
+                elif name in ("pumpking", "pumpkins", "pumpkin"):
+                    CUSTOM_EMOJIS["pumpking"] = tag
+    except Exception as e:
+        print(f"Error fetching application emojis: {e}", flush=True)
+
+    if guilds:
+        for g in guilds:
+            for emo in g.emojis:
+                low = emo.name.lower()
+                if low in ("coins", "coin") and CUSTOM_EMOJIS["coins"] == "🪙":
+                    CUSTOM_EMOJIS["coins"] = str(emo)
+                elif low in ("pumpking", "pumpkins", "pumpkin") and CUSTOM_EMOJIS["pumpking"] == "🎃":
+                    CUSTOM_EMOJIS["pumpking"] = str(emo)
+
+    print(f"Loaded Emojis -> Coins: {CUSTOM_EMOJIS['coins']} | Pumpking: {CUSTOM_EMOJIS['pumpking']}", flush=True)
+
 def load_state():
     if os.path.exists(STATE_FILE):
         try:
@@ -82,7 +120,7 @@ def format_currency_display(curr_val, start_val):
         return f"`{format_number(c_num)}`"
     return f"`{curr_val}`"
 
-def format_place_Emoji(place_str):
+def format_place_emoji(place_str):
     if not place_str:
         return "❓ `Unknown`"
     low = place_str.lower()
@@ -135,6 +173,9 @@ def ping_version_update(place_name, place_id, old_ver, new_ver, player_name):
 
 def build_user_dashboard_embed(discord_user):
     discord_id_str = str(discord_user.id)
+    coin_emo = CUSTOM_EMOJIS["coins"]
+    pump_emo = CUSTOM_EMOJIS["pumpking"]
+
     with state_lock:
         state = load_state()
         user_info = state["users"].get(discord_id_str)
@@ -149,7 +190,7 @@ def build_user_dashboard_embed(discord_user):
                 "You don't have any Roblox accounts linked to your Discord profile yet.\n\n"
                 "**How to link:**\n"
                 "1️⃣ Click **🔗 Get Link Code** below.\n"
-                "2️⃣ Paste your code into the **femboy script ;3** UI in Roblox and click **Link**.\n"
+                "2️⃣ Paste your code into the **femboy script ;3** UI in Roblox and click **LINK**.\n"
                 "3️⃣ All accounts running in the same workspace will link automatically!"
             ),
             color=0xE74C3C
@@ -185,9 +226,9 @@ def build_user_dashboard_embed(discord_user):
         ver = info.get("version", "v?")
 
         if prev_place and prev_place != cur_place:
-            transition_str = f"{format_place_Emoji(prev_place)} ➔ {format_place_Emoji(cur_place)}"
+            transition_str = f"{format_place_emoji(prev_place)} ➔ {format_place_emoji(cur_place)}"
         else:
-            transition_str = f"{format_place_Emoji(cur_place)}"
+            transition_str = f"{format_place_emoji(cur_place)}"
 
         coins_str = format_currency_display(info.get("coins"), info.get("start_coins"))
         pumpkins_str = format_currency_display(info.get("pumpkins"), info.get("start_pumpkins"))
@@ -207,10 +248,10 @@ def build_user_dashboard_embed(discord_user):
 
         field_value = (
             f"📡 **State:** {health_badge} (`{ver}`)\n"
-            f"🔄 **Status:** {transition_str}\n"
+            f"🔄 **Current Status:** {transition_str}\n"
             f"{match_extra}"
-            f"🪙 **Coins:** {coins_str}\n"
-            f"🎃 **Pumpkins:** {pumpkins_str}\n"
+            f"{coin_emo} **Coins:** {coins_str}\n"
+            f"{pump_emo} **Pumpkins:** {pumpkins_str}\n"
             f"🏆 **W/L:** `{wins}W` / `{losses}L` *(Last: {last_event})*\n"
             f"🕒 **Updated:** <t:{ts}:R>"
         )
@@ -252,7 +293,7 @@ class ControlPanelView(discord.ui.View):
                 f"## `{code}`\n\n"
                 "**Steps to link your Roblox accounts:**\n"
                 "1. Execute **femboy script ;3** in Roblox.\n"
-                "2. Paste `{code}` into the **Link Code** box in the UI and press **Link**.\n"
+                f"2. Paste `{code}` into the **Discord Code** box in the UI and press **LINK**.\n"
                 "3. Your account (and all alts sharing the same workspace) will immediately appear in **📊 My Accounts**!"
             ),
             color=0x5865F2
@@ -345,7 +386,6 @@ def report():
             if not is_valid_currency(acc_info.get("start_pumpkins")):
                 acc_info["start_pumpkins"] = str(raw_pumpkins).strip()
 
-        linked_discord_id = None
         if link_code and link_code in state["codes"]:
             linked_discord_id = state["codes"][link_code]
             acc_info["owner_id"] = linked_discord_id
@@ -370,6 +410,8 @@ intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 def create_master_panel_embed():
+    coin_emo = CUSTOM_EMOJIS["coins"]
+    pump_emo = CUSTOM_EMOJIS["pumpking"]
     embed = discord.Embed(
         title="🌸 femboy script ;3 — Account Control Panel",
         description=(
@@ -377,7 +419,7 @@ def create_master_panel_embed():
             "Link your Roblox accounts to monitor your farm progress in real time directly from Discord.\n\n"
             "✨ **Features:**\n"
             "• 🔄 **Live State Transitions:** `In Match ➔ Lobby`\n"
-            "• 🪙 **Currency Tracker:** Live `Coins` & `Pumpkins` with session profit (`+Δ`)\n"
+            f"• {coin_emo} **Currency Tracker:** Live `Coins` & {pump_emo} `Pumpkins` with session profit (`+Δ`)\n"
             "• ⚔️ **Match Telemetry:** Current Wave, Cash & Win/Loss counter\n"
             "• 🟢 **Disconnect Watchdog:** Instant online/offline status & `<t:ts:R>` timer\n\n"
             "👇 **Use the buttons below to manage and view your accounts:**"
@@ -389,6 +431,7 @@ def create_master_panel_embed():
 
 @bot.event
 async def on_ready():
+    load_custom_emojis(bot.application_id, bot.guilds)
     bot.add_view(ControlPanelView())
     bot.add_view(DashboardRefreshView())
     try:
