@@ -3,23 +3,27 @@ import re
 import time
 import json
 import secrets
+import asyncio
 import threading
 import requests
 import discord
 from discord.ext import commands
-from discord import app_commands
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
 
 load_dotenv()
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")
-ROLE_ID = os.getenv("ROLE_ID", "1560317338291675147")
+raw_token = os.getenv("BOT_TOKEN") or os.getenv("DISCORD_TOKEN") or os.getenv("TOKEN") or ""
+BOT_TOKEN = raw_token.strip().strip('"').strip("'")
+
+WEBHOOK_URL = (os.getenv("WEBHOOK_URL") or "").strip()
+ROLE_ID = (os.getenv("ROLE_ID") or "1560317338291675147").strip()
 PORT = int(os.getenv("PORT", 3000))
 
 STATE_FILE = "bot_state.json"
 state_lock = threading.Lock()
+bot_started_lock = threading.Lock()
+bot_is_running = False
 
 app = Flask(__name__)
 
@@ -42,13 +46,13 @@ def load_custom_emojis(app_id, guilds=None):
                 eid = item.get("id")
                 anim = item.get("animated", False)
                 prefix = "a" if anim else ""
-                tag = f"<{prefix}:{ item.get('name') }:{eid}>"
+                tag = f"<{prefix}:{item.get('name')}:{eid}>"
                 if name in ("coins", "coin"):
                     CUSTOM_EMOJIS["coins"] = tag
                 elif name in ("pumpking", "pumpkins", "pumpkin"):
                     CUSTOM_EMOJIS["pumpking"] = tag
     except Exception as e:
-        print(f"Error fetching application emojis: {e}", flush=True)
+        print(f"[EMOJI ERROR] {e}", flush=True)
 
     if guilds:
         for g in guilds:
@@ -59,7 +63,7 @@ def load_custom_emojis(app_id, guilds=None):
                 elif low in ("pumpking", "pumpkins", "pumpkin") and CUSTOM_EMOJIS["pumpking"] == "🎃":
                     CUSTOM_EMOJIS["pumpking"] = str(emo)
 
-    print(f"Loaded Emojis -> Coins: {CUSTOM_EMOJIS['coins']} | Pumpking: {CUSTOM_EMOJIS['pumpking']}", flush=True)
+    print(f"[INIT] Emojis ready -> Coins: {CUSTOM_EMOJIS['coins']} | Pumpking: {CUSTOM_EMOJIS['pumpking']}", flush=True)
 
 def load_state():
     if os.path.exists(STATE_FILE):
@@ -72,7 +76,7 @@ def load_state():
                 data.setdefault("codes", {})
                 return data
         except Exception as e:
-            print(f"Error reading state file: {e}", flush=True)
+            print(f"[STATE ERROR] {e}", flush=True)
     return {
         "versions": {},
         "accounts": {},
@@ -85,7 +89,7 @@ def save_state(state):
         with open(STATE_FILE, "w", encoding="utf-8") as f:
             json.dump(state, f, indent=2, ensure_ascii=False)
     except Exception as e:
-        print(f"Error saving state file: {e}", flush=True)
+        print(f"[SAVE ERROR] {e}", flush=True)
 
 def is_valid_currency(val):
     if val is None:
@@ -169,7 +173,7 @@ def ping_version_update(place_name, place_id, old_ver, new_ver, player_name):
     try:
         requests.post(WEBHOOK_URL, json=payload, timeout=10)
     except Exception as e:
-        print(f"Webhook ping error: {e}", flush=True)
+        print(f"[WEBHOOK ERROR] {e}", flush=True)
 
 def build_user_dashboard_embed(discord_user):
     discord_id_str = str(discord_user.id)
@@ -315,9 +319,84 @@ class ControlPanelView(discord.ui.View):
         )
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
+intents = discord.Intents.default()
+intents.message_content = True
+bot = commands.Bot(command_prefix="!", intents=intents)
+
+def create_master_panel_embed():
+    coin_emo = CUSTOM_EMOJIS["coins"]
+    pump_emo = CUSTOM_EMOJIS["pumpking"]
+    embed = discord.Embed(
+        title="🌸 femboy script ;3 — Account Control Panel",
+        description=(
+            "Welcome to the live **Multi-Account Farm Tracker**!\n"
+            "Link your Roblox accounts to monitor your farm progress in real time directly from Discord.\n\n"
+            "✨ **Features:**\n"
+            "• 🔄 **Live State Transitions:** `In Match ➔ Lobby`\n"
+            f"• {coin_emo} **Currency Tracker:** Live `Coins` & {pump_emo} `Pumpkins` with session profit (`+Δ`)\n"
+            "• ⚔️ **Match Telemetry:** Current Wave, Cash & Win/Loss counter\n"
+            "• 🟢 **Disconnect Watchdog:** Instant online/offline status & `<t:ts:R>` timer\n\n"
+            "👇 **Use the buttons below to manage and view your accounts:**"
+        ),
+        color=0xFF85B3
+    )
+    embed.set_footer(text="femboy script ;3 • Real-Time Telemetry System")
+    return embed
+
+@bot.event
+async def on_ready():
+    print(f"[DISCORD] Successfully logged in as {bot.user} (ID: {bot.user.id})", flush=True)
+    load_custom_emojis(bot.application_id, bot.guilds)
+    bot.add_view(ControlPanelView())
+    bot.add_view(DashboardRefreshView())
+    try:
+        synced = await bot.tree.sync()
+        print(f"[DISCORD] Synced {len(synced)} slash commands.", flush=True)
+    except Exception as e:
+        print(f"[DISCORD] Slash sync error: {e}", flush=True)
+
+@bot.command(name="panel")
+async def send_panel_cmd(ctx):
+    embed = create_master_panel_embed()
+    await ctx.send(embed=embed, view=ControlPanelView())
+
+@bot.tree.command(name="panel", description="Send the TD Account Control Panel")
+async def slash_panel(interaction: discord.Interaction):
+    embed = create_master_panel_embed()
+    await interaction.response.send_message(embed=embed, view=ControlPanelView())
+
+def start_discord_bot_thread():
+    global bot_is_running
+    with bot_started_lock:
+        if bot_is_running:
+            return
+        bot_is_running = True
+
+    if not BOT_TOKEN:
+        print("[CRITICAL] BOT_TOKEN is empty! Add BOT_TOKEN in Bothost environment variables!", flush=True)
+        return
+
+    def runner():
+        print(f"[INIT] Connecting to Discord (Token length: {len(BOT_TOKEN)})...", flush=True)
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            loop.run_until_complete(bot.start(BOT_TOKEN))
+        except Exception as e:
+            print(f"[DISCORD CRASH] Failed to start bot: {e}", flush=True)
+
+    t = threading.Thread(target=runner, daemon=True)
+    t.start()
+
+start_discord_bot_thread()
+
 @app.route("/", methods=["GET"])
 def index():
-    return jsonify({"status": "online", "service": "TD Bot & Monitor API"})
+    return jsonify({
+        "status": "online",
+        "discord_ready": bot.is_ready(),
+        "bot_user": str(bot.user) if bot.user else None
+    })
 
 @app.route("/report", methods=["POST"])
 def report():
@@ -405,63 +484,6 @@ def report():
         "timestamp": now_ts
     })
 
-intents = discord.Intents.default()
-intents.message_content = True
-bot = commands.Bot(command_prefix="!", intents=intents)
-
-def create_master_panel_embed():
-    coin_emo = CUSTOM_EMOJIS["coins"]
-    pump_emo = CUSTOM_EMOJIS["pumpking"]
-    embed = discord.Embed(
-        title="🌸 femboy script ;3 — Account Control Panel",
-        description=(
-            "Welcome to the live **Multi-Account Farm Tracker**!\n"
-            "Link your Roblox accounts to monitor your farm progress in real time directly from Discord.\n\n"
-            "✨ **Features:**\n"
-            "• 🔄 **Live State Transitions:** `In Match ➔ Lobby`\n"
-            f"• {coin_emo} **Currency Tracker:** Live `Coins` & {pump_emo} `Pumpkins` with session profit (`+Δ`)\n"
-            "• ⚔️ **Match Telemetry:** Current Wave, Cash & Win/Loss counter\n"
-            "• 🟢 **Disconnect Watchdog:** Instant online/offline status & `<t:ts:R>` timer\n\n"
-            "👇 **Use the buttons below to manage and view your accounts:**"
-        ),
-        color=0xFF85B3
-    )
-    embed.set_footer(text="femboy script ;3 • Real-Time Telemetry System")
-    return embed
-
-@bot.event
-async def on_ready():
-    load_custom_emojis(bot.application_id, bot.guilds)
-    bot.add_view(ControlPanelView())
-    bot.add_view(DashboardRefreshView())
-    try:
-        synced = await bot.tree.sync()
-        print(f"Synced {len(synced)} slash commands.", flush=True)
-    except Exception as e:
-        print(f"Slash sync error: {e}", flush=True)
-    print(f"Discord Bot logged in as {bot.user}", flush=True)
-
-@bot.command(name="panel")
-async def send_panel_cmd(ctx):
-    embed = create_master_panel_embed()
-    await ctx.send(embed=embed, view=ControlPanelView())
-
-@bot.tree.command(name="panel", description="Send the TD Account Control Panel")
-async def slash_panel(interaction: discord.Interaction):
-    embed = create_master_panel_embed()
-    await interaction.response.send_message(embed=embed, view=ControlPanelView())
-
-def run_flask():
-    print(f"Starting Flask API Server on port {PORT}...", flush=True)
-    app.run(host="0.0.0.0", port=PORT, use_reloader=False)
-
 if __name__ == "__main__":
-    flask_thread = threading.Thread(target=run_flask, daemon=True)
-    flask_thread.start()
-
-    if BOT_TOKEN:
-        bot.run(BOT_TOKEN)
-    else:
-        print("WARNING: BOT_TOKEN is not set in .env! Running Flask API only...", flush=True)
-        while True:
-            time.sleep(3600)
+    print(f"[INIT] Starting Flask API Server on port {PORT}...", flush=True)
+    app.run(host="0.0.0.0", port=PORT, use_reloader=False)
